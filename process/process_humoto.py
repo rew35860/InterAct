@@ -32,7 +32,9 @@ from tqdm import tqdm
 #   ./data/humoto/raw      -> HUMOTO *data* release  (<seq>/<seq>.glb, .png)  [= humoto/humoto]
 #   ./data/humoto/upbone   -> extracted up_bone pickles  (<seq>/<seq>.pkl)
 #   ./models               -> SMPL-X / SMPL-H model files   [=inside InterAct repo, not humoto]
-# Outputs are written under ./data/humoto/{sequences_canonical,objects}/
+# Outputs are written under ./data/humoto/{sequences_seg,objects}/
+# (sequences_seg = pre-canonical staging; run canonicalize_human.py to produce
+#  sequences_canonical with forward-facing alignment + floor normalization)
 #
 # Symlink commands (run once from the project root, point at YOUR locations):
 #   ln -s /path/to/humoto              ./humoto                 [humoto code repo]  
@@ -44,6 +46,9 @@ HUMOTO_RAW    = os.environ.get('HUMOTO_RAW',      './data/humoto/raw')
 HUMOTO_UPBONE = os.environ.get('HUMOTO_UPBONE',   './data/humoto/upbone')
 MODEL_PATH    = os.environ.get('INTERACT_MODELS', './models')
 OUTPUT_ROOT   = os.environ.get('HUMOTO_OUTPUT',   './data/humoto')
+# Text source: animations.json from the HUMOTO release (has per-clip short_script).
+#   ln -s /path/to/humoto_adobe/animations.json ./data/humoto/animations.json
+HUMOTO_ANIMATIONS = os.environ.get('HUMOTO_ANIMATIONS', './data/humoto/animations.json')
 
 # humoto's differentiable Mixamo model lives in its repo
 sys.path.insert(0, HUMOTO_REPO)
@@ -231,6 +236,55 @@ def build_object_mesh(glb_path, primary_object, n_sample=340, seed=0):
     return oriented, pts.astype(np.float32)
 
 
+def _pos_tag(sentence, nlp):
+    """Replicate process_text.process_text: drop non-alpha tokens, lemmatize
+    NOUN/VERB (except 'left'), return 'word/POS word/POS ...'."""
+    sentence = sentence.replace('-', '')
+    toks = []
+    for token in nlp(sentence):
+        word = token.text
+        if not word.isalpha():
+            continue
+        if token.pos_ in ('NOUN', 'VERB') and word != 'left':
+            word = token.lemma_
+        toks.append(f'{word}/{token.pos_}')
+    return ' '.join(toks)
+
+
+def write_text_files(output_root=OUTPUT_ROOT, animations_json=HUMOTO_ANIMATIONS,
+                     seq_names=None, verbose=True):
+    """Write text.txt (InterAct format) into each sequences_seg/<seq>/ from the
+    HUMOTO animations.json short_script. Single-level ('natural') text only;
+    LLM paraphrase/shorten lines can be appended later for augmentation parity.
+
+    Line format: '<sentence>#<word/POS ...>#0.0#0.0'
+    """
+    import json
+    import spacy
+    nlp = spacy.load('en_core_web_sm')
+    with open(animations_json) as f:
+        anims = {a['fileName']: a['short_script'] for a in json.load(f)}
+
+    seg_root = os.path.join(output_root, 'sequences_seg')
+    if seq_names is None:
+        seq_names = sorted(os.listdir(seg_root))
+
+    written = 0
+    for seq in seq_names:
+        if seq not in anims:
+            if verbose:
+                print(f'  [skip text] no short_script for {seq}')
+            continue
+        sentence = anims[seq].strip()
+        line = f'{sentence}#{_pos_tag(sentence, nlp)}#0.0#0.0'
+        with open(os.path.join(seg_root, seq, 'text.txt'), 'w') as f:
+            f.write(line)
+        written += 1
+    if verbose:
+        print(f'wrote text.txt for {written}/{len(seq_names)} sequences')
+    return written
+
+
 def process_humoto_sequence(pkl_path, glb_path, seq_name, primary_object,
                             smplx_model, mx_model, output_root=OUTPUT_ROOT,
                             body_corr=BODY_CORR, seed=0, verbose=True):
@@ -251,7 +305,7 @@ def process_humoto_sequence(pkl_path, glb_path, seq_name, primary_object,
         print(f"[2/4] fit: mean={errors.mean() * 100:.2f}cm  max={errors.max() * 100:.2f}cm  "
               f"||beta||={betas_fit.norm():.2f}")
 
-    out_seq_dir = os.path.join(output_root, 'sequences_canonical', seq_name)
+    out_seq_dir = os.path.join(output_root, 'sequences_seg', seq_name)
     out_obj_dir = os.path.join(output_root, 'objects', primary_object)
     os.makedirs(out_seq_dir, exist_ok=True)
     os.makedirs(out_obj_dir, exist_ok=True)
@@ -296,3 +350,9 @@ if __name__ == '__main__':
             smplx_model=smplx_model, mx_model=mx_model,
         )
         print(result)
+
+    # Optional: write text.txt from animations.json (needs spaCy). Skips if absent.
+    if os.path.exists(HUMOTO_ANIMATIONS):
+        write_text_files(seq_names=list(SEQUENCE_CONFIG.keys()))
+    else:
+        print(f'(skip text) {HUMOTO_ANIMATIONS} not found - symlink animations.json to enable')
