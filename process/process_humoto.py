@@ -145,8 +145,18 @@ HAND_NAMES = [c[1] for c in HAND_CORR]
 
 # Q1(a): hardcoded primary-object choice per sequence (inspect PNG thumbnails to fill in)
 SEQUENCE_CONFIG = {
-    'baking_with_spatula_mixing_bowl_and_scooping_to_tray-244': 'spatula',
+    'baking_with_spatula_mixing_bowl_and_scooping_to_tray-244':                         'spatula',
+    'carry_organizer_with_both_hands_at_chest_height-436':                              'draw_organizer_tray',
+    'carry_side_table_with_both_hands_walk_around-536':                                 'side_table',
+    'carry_vase_right_hand_transfer_to_left_hand_transfer_to_right_hand_walk_around-942':'vase',
+    'carry_wok_turner_right_hand_walk_around-968':                                      'wok_turner',
+    'carrying_cutting_board_with_right_hand-213':                                       'cutting_board',
+    'carrying_whisk_with_right_hand-037':                                               'whisk',
+    'checking_floor_lamp_with_right_hand-024':                                          'floor_lamp',
+    'checking_organizer_medium_on_table-289':                                           'organizer_medium',
+    'chopping_and_slitting_with_knife-706':                                             'knife',
 }
+
 
 
 def load_models(model_path=MODEL_PATH, humoto_json=HUMOTO_JSON, device='cpu'):
