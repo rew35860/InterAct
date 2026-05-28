@@ -62,7 +62,8 @@ Z_TO_Y_MAT = np.array([[1, 0, 0],
 # Undoes the axis-convention rotation Blender bakes into GLB object meshes
 R_XFLIP_MAT = Rot.from_euler('x', 90, degrees=True).as_matrix().astype(np.float32)
 
-# SMPL-X body joint index → (name, Mixamo bone). Body only; hands/face zeroed for v1.
+# SMPL-X body joint index → (name, Mixamo bone). Face joints stay zeroed; hands are
+# fit separately (see HAND_CORR).
 BODY_CORR = [
     (0,  'pelvis',         'mixamorig:Hips'),
     (1,  'left_hip',       'mixamorig:LeftUpLeg'),
@@ -90,6 +91,57 @@ BODY_CORR = [
 # SMPL-X body kinematic tree (parent index per joint; -1 = root). Useful for plots.
 PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19]
 BODY_NAMES = [c[1] for c in BODY_CORR]
+
+# SMPL-X hand joint index → (name, Mixamo bone). 4 targets per finger: the three
+# articulated joints (idx 25-54) plus the fingertip landmark (idx 66-75, regressed
+# from the mesh) which pins down the distal joint's orientation. Mixamo finger bones
+# are <Hand><Finger>{1,2,3} for the joints and {4} for the tip.
+HAND_CORR = [
+    (25, 'left_index1',   'mixamorig:LeftHandIndex1'),
+    (26, 'left_index2',   'mixamorig:LeftHandIndex2'),
+    (27, 'left_index3',   'mixamorig:LeftHandIndex3'),
+    (67, 'left_index',    'mixamorig:LeftHandIndex4'),
+    (28, 'left_middle1',  'mixamorig:LeftHandMiddle1'),
+    (29, 'left_middle2',  'mixamorig:LeftHandMiddle2'),
+    (30, 'left_middle3',  'mixamorig:LeftHandMiddle3'),
+    (68, 'left_middle',   'mixamorig:LeftHandMiddle4'),
+    (31, 'left_pinky1',   'mixamorig:LeftHandPinky1'),
+    (32, 'left_pinky2',   'mixamorig:LeftHandPinky2'),
+    (33, 'left_pinky3',   'mixamorig:LeftHandPinky3'),
+    (70, 'left_pinky',    'mixamorig:LeftHandPinky4'),
+    (34, 'left_ring1',    'mixamorig:LeftHandRing1'),
+    (35, 'left_ring2',    'mixamorig:LeftHandRing2'),
+    (36, 'left_ring3',    'mixamorig:LeftHandRing3'),
+    (69, 'left_ring',     'mixamorig:LeftHandRing4'),
+    (37, 'left_thumb1',   'mixamorig:LeftHandThumb1'),
+    (38, 'left_thumb2',   'mixamorig:LeftHandThumb2'),
+    (39, 'left_thumb3',   'mixamorig:LeftHandThumb3'),
+    (66, 'left_thumb',    'mixamorig:LeftHandThumb4'),
+    (40, 'right_index1',  'mixamorig:RightHandIndex1'),
+    (41, 'right_index2',  'mixamorig:RightHandIndex2'),
+    (42, 'right_index3',  'mixamorig:RightHandIndex3'),
+    (72, 'right_index',   'mixamorig:RightHandIndex4'),
+    (43, 'right_middle1', 'mixamorig:RightHandMiddle1'),
+    (44, 'right_middle2', 'mixamorig:RightHandMiddle2'),
+    (45, 'right_middle3', 'mixamorig:RightHandMiddle3'),
+    (73, 'right_middle',  'mixamorig:RightHandMiddle4'),
+    (46, 'right_pinky1',  'mixamorig:RightHandPinky1'),
+    (47, 'right_pinky2',  'mixamorig:RightHandPinky2'),
+    (48, 'right_pinky3',  'mixamorig:RightHandPinky3'),
+    (75, 'right_pinky',   'mixamorig:RightHandPinky4'),
+    (49, 'right_ring1',   'mixamorig:RightHandRing1'),
+    (50, 'right_ring2',   'mixamorig:RightHandRing2'),
+    (51, 'right_ring3',   'mixamorig:RightHandRing3'),
+    (74, 'right_ring',    'mixamorig:RightHandRing4'),
+    (52, 'right_thumb1',  'mixamorig:RightHandThumb1'),
+    (53, 'right_thumb2',  'mixamorig:RightHandThumb2'),
+    (54, 'right_thumb3',  'mixamorig:RightHandThumb3'),
+    (71, 'right_thumb',   'mixamorig:RightHandThumb4'),
+]
+HAND_SMPLX_IDX = [c[0] for c in HAND_CORR]   # gather indices into the (127,3) joint output
+HAND_NAMES = [c[1] for c in HAND_CORR]
+# left_hand_pose / right_hand_pose are 45 dims each (15 joints × 3 axis-angle), in
+# SMPL-X joint order; poses[:, 66:111] = left, poses[:, 111:156] = right.
 
 # Q1(a): hardcoded primary-object choice per sequence (inspect PNG thumbnails to fill in)
 SEQUENCE_CONFIG = {
@@ -121,38 +173,94 @@ def _frame_to_pose_params(frame_dict):
     return pp
 
 
-def compute_targets(arm, mx_model, body_corr=BODY_CORR):
-    """Mixamo armature frames → SMPL-X-indexed joint targets (T, 22, 3) in y-up."""
-    T = len(arm)
-    targets = np.zeros((T, 22, 3), dtype=np.float32)
-    bone_index = {b: i for i, b in enumerate(mx_model.bone_names)}
-    for t in range(T):
+def _mixamo_joints_yup(arm, mx_model):
+    """Run Mixamo FK on every frame → (joints (T, n_bones, 3) in y-up, bone_index)."""
+    bone_names = list(mx_model.bone_names)
+    bone_index = {b: i for i, b in enumerate(bone_names)}
+    out = np.zeros((len(arm), len(bone_names), 3), dtype=np.float32)
+    for t in range(len(arm)):
         with torch.no_grad():
             _, jp = mx_model(_frame_to_pose_params(arm[t]))
-        jm_zup = np.stack([jp[b].numpy()[0] for b in mx_model.bone_names])
-        jm_yup = jm_zup @ Z_TO_Y_MAT.T
-        for smplx_idx, _, mx_name in body_corr:
-            targets[t, smplx_idx] = jm_yup[bone_index[mx_name]]
+        jm_zup = np.stack([jp[b].numpy()[0] for b in bone_names])
+        out[t] = jm_zup @ Z_TO_Y_MAT.T
+    return out, bone_index
+
+
+def compute_targets(arm, mx_model, body_corr=BODY_CORR):
+    """Mixamo armature frames → SMPL-X-indexed body joint targets (T, 22, 3) in y-up."""
+    jm, bone_index = _mixamo_joints_yup(arm, mx_model)
+    targets = np.zeros((len(arm), 22, 3), dtype=np.float32)
+    for smplx_idx, _, mx_name in body_corr:
+        targets[:, smplx_idx] = jm[:, bone_index[mx_name]]
     return targets
 
 
 def load_targets(pkl_path, mx_model, body_corr=BODY_CORR):
-    """Load a humoto pickle → (targets (T,22,3) y-up SMPL-X joint targets, objs dict).
+    """Load a humoto pickle → (body targets (T,22,3) y-up, objs dict).
 
     Convenience wrapper so callers (and the inspection notebook) can get the
-    Mixamo joint targets without re-running the whole pipeline.
+    Mixamo body joint targets without re-running the whole pipeline.
     """
     with open(pkl_path, 'rb') as f:
         data = pickle.load(f)
     arm, objs = data['armature'], data['objects']
-    targets = compute_targets(arm, mx_model, body_corr)
-    return targets, objs
+    return compute_targets(arm, mx_model, body_corr), objs
 
 
-def fit_sequence(targets, smplx_model, n_steps_beta=600, n_steps_pose=80):
-    """Joint-position fit. Returns (betas, global_orient, body_pose, trans, errors)."""
+def load_all_targets(pkl_path, mx_model, body_corr=BODY_CORR, hand_corr=HAND_CORR):
+    """Load a humoto pickle, run FK once → (body (T,22,3), hand (T,40,3), objs).
+
+    `hand` columns are aligned to `hand_corr` order (== HAND_SMPLX_IDX gather order).
+    """
+    with open(pkl_path, 'rb') as f:
+        data = pickle.load(f)
+    arm, objs = data['armature'], data['objects']
+    jm, bone_index = _mixamo_joints_yup(arm, mx_model)
+    body = np.zeros((len(arm), 22, 3), dtype=np.float32)
+    for smplx_idx, _, mx_name in body_corr:
+        body[:, smplx_idx] = jm[:, bone_index[mx_name]]
+    hand = np.zeros((len(arm), len(hand_corr), 3), dtype=np.float32)
+    for j, (_, _, mx_name) in enumerate(hand_corr):
+        hand[:, j] = jm[:, bone_index[mx_name]]
+    return body, hand, objs
+
+
+def _fit_hands_frame(smplx_model, go, bp, tr, betas, hand_target, hand_idx,
+                     lh_init, rh_init, n_steps, lr=0.05):
+    """Fit left+right hand pose for ONE frame with the body frozen.
+
+    go/bp/tr/betas are detached (1,*) tensors; hand_target is (n_hand, 3);
+    hand_idx gathers the hand joints from the (127,3) joint output.
+    Returns (lh (1,45), rh (1,45), mean_err_m).
+    """
+    lh = lh_init.clone().requires_grad_(True)
+    rh = rh_init.clone().requires_grad_(True)
+    tgt = torch.as_tensor(hand_target)
+    opt = optim.Adam([lh, rh], lr=lr)
+    for _ in range(n_steps):
+        pred = smplx_model(global_orient=go, body_pose=bp, transl=tr, betas=betas,
+                           left_hand_pose=lh, right_hand_pose=rh).joints[0]
+        loss = (((pred[hand_idx] - tgt) ** 2).mean()
+                + 1e-4 * (lh ** 2).mean() + 1e-4 * (rh ** 2).mean())
+        opt.zero_grad(); loss.backward(); opt.step()
+    with torch.no_grad():
+        pred = smplx_model(global_orient=go, body_pose=bp, transl=tr, betas=betas,
+                           left_hand_pose=lh, right_hand_pose=rh).joints[0]
+        err = (pred[hand_idx] - tgt).norm(dim=1).mean().item()
+    return lh.detach(), rh.detach(), err
+
+
+def fit_sequence(targets, smplx_model, hand_targets=None, hand_idx=HAND_SMPLX_IDX,
+                 n_steps_beta=600, n_steps_pose=80, n_steps_hand0=250, n_steps_hand=60):
+    """Joint-position fit. Body is fit first (beta+pose, then per-frame pose); if
+    `hand_targets` (T, len(hand_idx), 3) is given, hands are fit per frame with the
+    body frozen.
+    Returns (betas, global_orient, body_pose, trans, left_hand, right_hand,
+             errors, hand_errors). left_hand/right_hand are (T, 45); zero if no
+    hand_targets.
+    """
     print(f"\n=== Fitting sequence (T={targets.shape[0]}) ===")
-    
+
     T = targets.shape[0]
 
     # ── frame-0: β + pose + trans jointly ──
@@ -185,11 +293,23 @@ def fit_sequence(targets, smplx_model, n_steps_beta=600, n_steps_pose=80):
     fitted_go = np.zeros((T, 3), dtype=np.float32)
     fitted_bp = np.zeros((T, 63), dtype=np.float32)
     fitted_tr = np.zeros((T, 3), dtype=np.float32)
+    fitted_lh = np.zeros((T, 45), dtype=np.float32)
+    fitted_rh = np.zeros((T, 45), dtype=np.float32)
 
     errors = np.zeros(T, dtype=np.float32)
+    hand_errors = np.zeros(T, dtype=np.float32)
     fitted_go[0] = go.detach()[0].numpy()
     fitted_bp[0] = bp.detach()[0].numpy()
     fitted_tr[0] = tr.detach()[0].numpy()
+
+    # ── frame-0 hands (cold start, body frozen) ──
+    if hand_targets is not None:
+        lh0, rh0, hand_errors[0] = _fit_hands_frame(
+            smplx_model, go.detach(), bp.detach(), tr.detach(), betas_fit,
+            hand_targets[0], hand_idx, torch.zeros(1, 45), torch.zeros(1, 45),
+            n_steps_hand0)
+        fitted_lh[0] = lh0[0].numpy()
+        fitted_rh[0] = rh0[0].numpy()
 
     # ── per-frame pose fit, warm-started, β frozen ──
     for t in tqdm(range(1, T), desc='per-frame pose fit'):
@@ -213,7 +333,17 @@ def fit_sequence(targets, smplx_model, n_steps_beta=600, n_steps_pose=80):
         with torch.no_grad():
             errors[t] = (pred - target_t).norm(dim=1).mean().item()
 
-    return betas_fit, fitted_go, fitted_bp, fitted_tr, errors
+        # hands: warm-started from t-1, body frozen at this frame's fit
+        if hand_targets is not None:
+            lh, rh, hand_errors[t] = _fit_hands_frame(
+                smplx_model, go_v.detach(), bp_v.detach(), tr_v.detach(), betas_fit,
+                hand_targets[t], hand_idx,
+                torch.from_numpy(fitted_lh[t - 1:t]), torch.from_numpy(fitted_rh[t - 1:t]),
+                n_steps_hand)
+            fitted_lh[t] = lh[0].numpy()
+            fitted_rh[t] = rh[0].numpy()
+
+    return betas_fit, fitted_go, fitted_bp, fitted_tr, fitted_lh, fitted_rh, errors, hand_errors
 
 
 def build_object_npz(objs, primary_object):
@@ -226,10 +356,12 @@ def build_object_npz(objs, primary_object):
     return angles, trans_yup.astype(np.float32)
 
 
-def build_object_mesh(glb_path, primary_object, n_sample=340, seed=0):
-    """Extract object mesh from GLB, undo the GLB axis flip, sample N surface points."""
-    scene = trimesh.load(glb_path)
-    mesh = scene.geometry[primary_object]
+def build_object_mesh(glb_path, object_name, n_sample=340, seed=0, scene=None):
+    """Extract object mesh from GLB, undo the GLB axis flip, sample N surface points.
+    Pass a pre-loaded `scene` to avoid reloading the GLB for each object."""
+    if scene is None:
+        scene = trimesh.load(glb_path)
+    mesh = scene.geometry[object_name]
     oriented = trimesh.Trimesh(vertices=mesh.vertices @ R_XFLIP_MAT.T, faces=mesh.faces)
     np.random.seed(seed)
     pts, _ = trimesh.sample.sample_surface(oriented, n_sample)
@@ -294,40 +426,61 @@ def process_humoto_sequence(pkl_path, glb_path, seq_name, primary_object,
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    targets, objs = load_targets(pkl_path, mx_model, body_corr)
+    targets, hand_targets, objs = load_all_targets(pkl_path, mx_model, body_corr)
     if primary_object not in objs:
         raise ValueError(f"'{primary_object}' not in pickle objects: {list(objs.keys())}")
     T = len(targets)
     if verbose:
         print(f"[1/4] {seq_name}: T={T}, objects={list(objs.keys())}")
-    betas_fit, fitted_go, fitted_bp, fitted_tr, errors = fit_sequence(targets, smplx_model)
+    (betas_fit, fitted_go, fitted_bp, fitted_tr,
+     fitted_lh, fitted_rh, errors, hand_errors) = fit_sequence(
+        targets, smplx_model, hand_targets=hand_targets)
     if verbose:
-        print(f"[2/4] fit: mean={errors.mean() * 100:.2f}cm  max={errors.max() * 100:.2f}cm  "
-              f"||beta||={betas_fit.norm():.2f}")
+        print(f"[2/4] fit: body mean={errors.mean() * 100:.2f}cm  max={errors.max() * 100:.2f}cm  "
+              f"hand mean={hand_errors.mean() * 100:.2f}cm  ||beta||={betas_fit.norm():.2f}")
 
     out_seq_dir = os.path.join(output_root, 'sequences_seg', seq_name)
     out_obj_dir = os.path.join(output_root, 'objects', primary_object)
     os.makedirs(out_seq_dir, exist_ok=True)
     os.makedirs(out_obj_dir, exist_ok=True)
 
-    poses = np.concatenate([fitted_go, fitted_bp, np.zeros((T, 90), dtype=np.float32)], axis=1)
+    poses = np.concatenate([fitted_go, fitted_bp, fitted_lh, fitted_rh], axis=1)  # (T, 156)
     np.savez(os.path.join(out_seq_dir, 'human.npz'),
              poses=poses.astype(np.float32),
              betas=betas_fit[0].numpy().astype(np.float32),
              trans=fitted_tr.astype(np.float32),
              gender='neutral')
 
-    obj_angles, obj_trans = build_object_npz(objs, primary_object)
-    np.savez(os.path.join(out_seq_dir, 'object.npz'),
-             angles=obj_angles, trans=obj_trans, name=primary_object)
-    if verbose:
-        print(f"[3/4] wrote human.npz + object.npz → {out_seq_dir}")
+    # ── Objects: write EVERY object as object_<name>.npz (+ mesh + sample_points).
+    #    Multi-object STORAGE is faithful here: canonicalize_human canonicalizes
+    #    every object_<name>.npz. `primary_object` is the one motion.npy will use
+    #    as a TEMPORARY SCAFFOLD.
+    #    TODO(thesis, open question): true multi-object motion representation.
+    #    InterAct's motion.npy is single-object (476 human + 486 one-object). How
+    #    to encode N objects (concat? per-object reps? attention?) is unresolved —
+    #    flagged for advisor. For now motion.npy uses only `primary_object`.
+    scene = trimesh.load(glb_path)
+    written_objs = []
+    for obj_name in objs:
+        if obj_name not in scene.geometry:
+            if verbose:
+                print(f"   [skip obj] '{obj_name}': no GLB geometry")
+            continue
+        ang, tr = build_object_npz(objs, obj_name)
+        np.savez(os.path.join(out_seq_dir, f'object_{obj_name}.npz'),
+                 angles=ang, trans=tr, name=obj_name)
+        obj_dir = os.path.join(output_root, 'objects', obj_name)
+        os.makedirs(obj_dir, exist_ok=True)
+        mesh, pts = build_object_mesh(glb_path, obj_name, seed=seed, scene=scene)
+        np.save(os.path.join(obj_dir, 'sample_points.npy'), pts)
+        mesh.export(os.path.join(obj_dir, f'{obj_name}.obj'))
+        written_objs.append(obj_name)
 
-    oriented_mesh, sample_pts = build_object_mesh(glb_path, primary_object, seed=seed)
-    np.save(os.path.join(out_obj_dir, 'sample_points.npy'), sample_pts)
-    oriented_mesh.export(os.path.join(out_obj_dir, f'{primary_object}.obj'))
+    if primary_object not in written_objs:
+        raise ValueError(f"primary '{primary_object}' not written (no GLB geometry?)")
     if verbose:
-        print(f"[4/4] wrote {primary_object} mesh + sample_points → {out_obj_dir}")
+        print(f"[3/4] wrote human.npz + {len(written_objs)} object_<name>.npz "
+              f"(primary='{primary_object}') + meshes/sample_points → {out_seq_dir}")
 
     return {
         'seq_dir': out_seq_dir,
@@ -335,6 +488,8 @@ def process_humoto_sequence(pkl_path, glb_path, seq_name, primary_object,
         'betas': betas_fit[0].numpy(),
         'mean_err_cm': float(errors.mean() * 100),
         'max_err_cm': float(errors.max() * 100),
+        'hand_mean_err_cm': float(hand_errors.mean() * 100),
+        'hand_max_err_cm': float(hand_errors.max() * 100),
         'T': T,
     }
 
