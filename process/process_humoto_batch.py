@@ -236,45 +236,44 @@ def load_all_targets(pkl_path, mx_model, body_corr=BODY_CORR, hand_corr=HAND_COR
     return (body, hand, objs, arm) if return_arm else (body, hand, objs)
 
 
-def _global_orient_init(arm, fitted_go0):
-    """Per-frame global_orient init (T,3) from the Mixamo root (Hips) rotation.
-
-    The pelvis orientation tracks the Mixamo Hips bone, so we read its world rotation
-    per frame (root bone → local == world), map z-up → y-up by a similarity transform,
-    and apply the constant offset that makes frame 0 match the frame-0 SMPL-X fit.
-    This gives Adam a good starting orientation even for full turns (walk-around clips),
-    which a frame-0 broadcast cannot. Falls back to broadcast if Hips is absent.
-    """
+def _global_orient_init(arm, go0):
+    """Per-frame global_orient (T,3) from the Mixamo Hips rotation, calibrated so
+    frame 0 matches the frame-0 fit. Gives the optimiser a good per-frame facing so
+    turns/walk-arounds converge instead of getting stuck. Falls back to a frame-0
+    broadcast if Hips is absent."""
     if 'mixamorig:Hips' not in arm[0]:
-        return np.tile(fitted_go0, (len(arm), 1)).astype(np.float32)
+        return np.tile(go0, (len(arm), 1)).astype(np.float32)
     Zy = Z_TO_Y_MAT.astype(np.float64)
-    hips = []
-    for fr in arm:
-        w, x, y, z = np.asarray(fr['mixamorig:Hips'], dtype=np.float64)[:4]
-        R_zup = Rot.from_quat([x, y, z, w]).as_matrix()
-        hips.append(Zy @ R_zup @ Zy.T)                       # similarity → y-up
-    hips = np.stack(hips)                                    # (T,3,3)
-    offset = Rot.from_rotvec(fitted_go0).as_matrix() @ hips[0].T   # const: go0 = offset·hips0
-    go = Rot.from_matrix(offset[None] @ hips).as_rotvec()
-    return go.astype(np.float32)
+    H = np.stack([Zy @ Rot.from_quat(np.asarray(fr['mixamorig:Hips'], np.float64)[[1, 2, 3, 0]]).as_matrix() @ Zy.T
+                  for fr in arm])
+    offset = Rot.from_rotvec(go0).as_matrix() @ H[0].T          # const: go0 = offset·H0
+    return Rot.from_matrix(offset[None] @ H).as_rotvec().astype(np.float32)
+
+
+def _anti_flip(bp):
+    """Anatomical anti-flip penalty: knees only flex (X-rot >= 0, no hyperextension);
+    elbows keep their flexion sign. bp index = (joint-1)*3 + axis.
+      knee L = joint4 X = idx9,  knee R = joint5 X = idx12
+      elbow L = joint18 Y = idx52 (flex negative),  elbow R = joint19 Y = idx55 (flex positive)"""
+    relu = torch.nn.functional.relu
+    return (relu(-bp[:, 9]).pow(2).mean() + relu(-bp[:, 12]).pow(2).mean()
+            + relu(bp[:, 52]).pow(2).mean() + relu(-bp[:, 55]).pow(2).mean())
 
 
 def fit_sequence(targets, smplx_model, hand_targets=None, hand_idx=HAND_SMPLX_IDX,
-                 arm=None, device=None, n_steps_beta=600, n_steps_body=500,
-                 n_steps_hand=800, lr=0.05, w_smooth_body=0.5, w_smooth_hand=0.2,
-                 verbose=True):
-    """Batched joint-position fit (GPU-friendly). All T frames are optimized jointly:
-      Stage A  frame-0 betas + pose + trans (betas are shared across frames).
-      Stage B  body (global_orient, body_pose, trans) for ALL frames at once, betas
-               frozen, with a temporal-smoothness prior in place of the old per-frame
-               warm-start. global_orient is initialised from the Mixamo Hips rotation
-               (pass `arm`) so large turns converge.
-      Stage C  hands (left/right hand pose) for all frames, body frozen.
-    `device='cuda'` fits on GPU (falls back to CPU); the SMPL-X model is moved to the
-    chosen device and restored afterwards. Returns
-      (betas (1,16) cpu tensor, global_orient (T,3), body_pose (T,63), trans (T,3),
-       left_hand (T,45), right_hand (T,45), errors (T,), hand_errors (T,)).
-    """
+                 arm=None, device=None, n_steps_beta=600, n_steps_body=1000,
+                 n_steps_hand=800, lr=0.05, w_smooth_body=0.5, w_smooth_trans=0.2,
+                 w_smooth_hand=0.2, w_anti_flip=5.0, verbose=True):
+    """Batched, temporally-coherent joint-position fit (GPU-friendly):
+      A  frame-0 betas + pose + trans (betas shared across all frames).
+      B  ALL frames at once: global_orient (init from Mixamo Hips — pass `arm`),
+         body_pose, trans, with temporal smoothness on body_pose/trans and an
+         anti-flip prior (knees can't hyperextend; elbows keep their flexion sign).
+      C  ALL frames: left/right hand pose, body frozen.
+    device='cuda' fits on GPU (the SMPL-X model is moved there and restored to its
+    original device afterwards, so callers using it on CPU are unaffected). Returns
+      (betas(1,16) cpu tensor, global_orient(T,3), body_pose(T,63), trans(T,3),
+       left_hand(T,45), right_hand(T,45), errors(T,), hand_errors(T,))."""
     T = targets.shape[0]
     dev = torch.device(device if device is not None
                         else ('cuda' if torch.cuda.is_available() else 'cpu'))
@@ -293,69 +292,56 @@ def fit_sequence(targets, smplx_model, hand_targets=None, hand_idx=HAND_SMPLX_ID
                      jaw_pose=z(B, 3), leye_pose=z(B, 3), reye_pose=z(B, 3),
                      expression=z(B, n_expr)).joints
 
-    tgt = torch.as_tensor(targets, device=dev)                       # (T,22,3)
-    htgt = (torch.as_tensor(hand_targets, device=dev)                # (T,40,3)
-            if hand_targets is not None else None)
+    tgt = torch.as_tensor(targets, device=dev)
+    htgt = torch.as_tensor(hand_targets, device=dev) if hand_targets is not None else None
 
     try:
-        # ── Stage A: betas + frame-0 pose/trans (batch 1) ──
+        # ── A: betas + frame-0 pose/trans (batch 1) ──
         with torch.no_grad():
             pelvis0 = joints(z(1, 3), z(1, 63), z(1, 3), z(1, 16), z(1, 45), z(1, 45))[0, 0]
         betas = z(1, 16).requires_grad_()
-        go0 = z(1, 3).requires_grad_()
-        bp0 = z(1, 63).requires_grad_()
+        go0 = z(1, 3).requires_grad_(); bp0 = z(1, 63).requires_grad_()
         tr0 = (tgt[0, 0] - pelvis0).view(1, 3).clone().requires_grad_()
         opt = optim.Adam([betas, go0, bp0, tr0], lr=lr)
         for _ in range(n_steps_beta):
             pred = joints(go0, bp0, tr0, betas, z(1, 45), z(1, 45))[0, :22]
-            loss = (((pred - tgt[0]) ** 2).mean()
-                    + 1e-3 * (betas ** 2).mean() + 5e-4 * (bp0 ** 2).mean())
+            loss = ((pred - tgt[0]) ** 2).mean() + 1e-3 * (betas ** 2).mean() + 5e-4 * (bp0 ** 2).mean()
             opt.zero_grad(); loss.backward(); opt.step()
-        betas_fit = betas.detach()
-        betas_T = betas_fit.expand(T, 16)
+        betas_fit = betas.detach(); betas_T = betas_fit.expand(T, 16)
         if verbose:
-            e0 = (pred.detach() - tgt[0]).norm(dim=1).mean().item() * 100
-            print(f"[A] frame-0 betas fit: {e0:.2f}cm  ||beta||={betas_fit.norm():.2f}")
+            print(f"[A] frame-0 betas fit: {(pred.detach()-tgt[0]).norm(dim=1).mean()*100:.2f}cm "
+                  f"||beta||={betas_fit.norm():.2f}")
 
-        # ── Stage B: body for all frames (batch T), betas frozen ──
-        go_init = (_global_orient_init(arm, go0.detach()[0].cpu().numpy()) if arm is not None
-                   else np.tile(go0.detach()[0].cpu().numpy(), (T, 1)))
+        # ── B: all-frames body (betas frozen) ──
+        go0_np = go0.detach()[0].cpu().numpy()
+        go_init = _global_orient_init(arm, go0_np) if arm is not None else np.tile(go0_np, (T, 1))
         go = torch.as_tensor(go_init, device=dev).clone().requires_grad_()
         bp = bp0.detach().expand(T, 63).clone().requires_grad_()
-        tr = (tgt[:, 0] - pelvis0).clone().requires_grad_()          # per-frame pelvis init
+        tr = (tgt[:, 0] - pelvis0).clone().requires_grad_()
         opt = optim.Adam([go, bp, tr], lr=lr)
         for step in range(n_steps_body):
             J = joints(go, bp, tr, betas_T, z(T, 45), z(T, 45))[:, :22]
-            pos = ((J - tgt) ** 2).mean()
-            # NB: global_orient is NOT smoothed — axis-angle wraps at ±180°, and the
-            # Hips-derived init already tracks the turn; penalising its frame diff would
-            # fight the wrap and corrupt turning frames. Smooth only body_pose + trans.
-            smooth = (((bp[1:] - bp[:-1]) ** 2).mean()
-                      + ((tr[1:] - tr[:-1]) ** 2).mean())
-            loss = pos + w_smooth_body * smooth + 5e-4 * (bp ** 2).mean()
+            loss = (((J - tgt) ** 2).mean()
+                    + w_smooth_body * ((bp[1:] - bp[:-1]) ** 2).mean()
+                    + w_smooth_trans * ((tr[1:] - tr[:-1]) ** 2).mean()
+                    + 5e-4 * (bp ** 2).mean()
+                    + w_anti_flip * _anti_flip(bp))
             opt.zero_grad(); loss.backward(); opt.step()
-            if verbose and (step % 200 == 0 or step == n_steps_body - 1):
+            if verbose and (step % 250 == 0 or step == n_steps_body - 1):
                 with torch.no_grad():
-                    e = (J.detach() - tgt).norm(dim=2).mean().item() * 100
-                print(f"[B] body  step {step:4d}: {e:.2f}cm")
+                    print(f"[B] body step {step:4d}: {(J.detach()-tgt).norm(dim=2).mean()*100:.2f}cm")
 
-        # ── Stage C: hands for all frames (batch T), body frozen ──
+        # ── C: all-frames hands (body frozen) ──
         go_f, bp_f, tr_f = go.detach(), bp.detach(), tr.detach()
-        lh = z(T, 45).requires_grad_()
-        rh = z(T, 45).requires_grad_()
+        lh = z(T, 45).requires_grad_(); rh = z(T, 45).requires_grad_()
         if htgt is not None:
             opt = optim.Adam([lh, rh], lr=lr)
             for step in range(n_steps_hand):
                 Jh = joints(go_f, bp_f, tr_f, betas_T, lh, rh)[:, hand_idx]
-                pos = ((Jh - htgt) ** 2).mean()
-                smooth = ((lh[1:] - lh[:-1]) ** 2).mean() + ((rh[1:] - rh[:-1]) ** 2).mean()
-                loss = (pos + w_smooth_hand * smooth
+                loss = (((Jh - htgt) ** 2).mean()
+                        + w_smooth_hand * (((lh[1:]-lh[:-1])**2).mean() + ((rh[1:]-rh[:-1])**2).mean())
                         + 1e-4 * (lh ** 2).mean() + 1e-4 * (rh ** 2).mean())
                 opt.zero_grad(); loss.backward(); opt.step()
-                if verbose and (step % 200 == 0 or step == n_steps_hand - 1):
-                    with torch.no_grad():
-                        e = (Jh.detach() - htgt).norm(dim=2).mean().item() * 100
-                    print(f"[C] hand  step {step:4d}: {e:.2f}cm")
 
         # ── per-frame errors ──
         with torch.no_grad():
@@ -363,7 +349,6 @@ def fit_sequence(targets, smplx_model, hand_targets=None, hand_idx=HAND_SMPLX_ID
             errors = (Jall[:, :22] - tgt).norm(dim=2).mean(dim=1).cpu().numpy().astype(np.float32)
             hand_errors = ((Jall[:, hand_idx] - htgt).norm(dim=2).mean(dim=1).cpu().numpy().astype(np.float32)
                            if htgt is not None else np.zeros(T, dtype=np.float32))
-
         out = (betas_fit.cpu(),
                go.detach().cpu().numpy().astype(np.float32),
                bp.detach().cpu().numpy().astype(np.float32),
@@ -372,7 +357,7 @@ def fit_sequence(targets, smplx_model, hand_targets=None, hand_idx=HAND_SMPLX_ID
                rh.detach().cpu().numpy().astype(np.float32),
                errors, hand_errors)
     finally:
-        smplx_model.to(orig_dev)     # restore (nn.Module.to moves in place)
+        smplx_model.to(orig_dev)        # restore (nn.Module.to moves in place)
     return out
 
 

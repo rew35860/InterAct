@@ -45,7 +45,7 @@ HUMOTO_JSON   = os.path.join(HUMOTO_REPO, 'human_model', 'human_model_up_bone_zu
 HUMOTO_RAW    = os.environ.get('HUMOTO_RAW',      './data/humoto/raw')
 HUMOTO_UPBONE = os.environ.get('HUMOTO_UPBONE',   './data/humoto/upbone')
 MODEL_PATH    = os.environ.get('INTERACT_MODELS', './models')
-OUTPUT_ROOT   = os.environ.get('HUMOTO_OUTPUT',   './data/humoto')
+OUTPUT_ROOT   = os.environ.get('HUMOTO_OUTPUT',   './data/humoto_processed')
 # Text source: animations.json from the HUMOTO release (has per-clip short_script).
 #   ln -s /path/to/humoto_adobe/animations.json ./data/humoto/animations.json
 HUMOTO_ANIMATIONS = os.environ.get('HUMOTO_ANIMATIONS', './data/humoto/animations.json')
