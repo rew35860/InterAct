@@ -23,37 +23,21 @@ import smplx
 from scipy.spatial.transform import Rotation as Rot
 from tqdm import tqdm
 
-# Portable paths, relative to the InterAct project root; resolve via symlinks you
-# create (override with env vars if your layout differs). No machine-specific paths.
-#
-# NOTE: the HUMOTO *code* repo and the Adobe *data* release are both literally named
-# "humoto" — keep them in separate trees to avoid confusion:
-#   ./humoto               -> HUMOTO *code* repo    (contains human_model/, scripts/, ...)
-#   ./data/humoto/raw      -> HUMOTO *data* release  (<seq>/<seq>.glb, .png)  [= humoto/humoto]
-#   ./data/humoto/upbone   -> extracted up_bone pickles  (<seq>/<seq>.pkl)
-#   ./models               -> SMPL-X / SMPL-H model files   [=inside InterAct repo, not humoto]
-# Outputs are written under ./data/humoto/{sequences_seg,objects}/
-# (sequences_seg = pre-canonical staging; run canonicalize_human.py to produce
-#  sequences_canonical with forward-facing alignment + floor normalization)
-#
-# Symlink commands (run once from the project root, point at YOUR locations):
-#   ln -s /path/to/humoto              ./humoto                 [humoto code repo]  
-#   ln -s /path/to/humoto/humoto       ./data/humoto/raw        [humoto data repo]
-#   ln -s /path/to/humoto_upbone       ./data/humoto/upbone     [extracted up_bone pickles]
-HUMOTO_REPO   = os.environ.get('HUMOTO_REPO',     './humoto')
-HUMOTO_JSON   = os.path.join(HUMOTO_REPO, 'human_model', 'human_model_up_bone_zup.json')
-HUMOTO_RAW    = os.environ.get('HUMOTO_RAW',      './data/humoto/raw')
-HUMOTO_UPBONE = os.environ.get('HUMOTO_UPBONE',   './data/humoto/upbone')
-# Optional per-object GLB dir (full-dataset layout: humoto_objects_0805/<obj>/<obj>.glb).
-# When set, object meshes are loaded from there instead of being expected
-# inside the sequence GLB (the smaller released subset embeds them; the full
-# release does not).
-HUMOTO_OBJECTS = os.environ.get('HUMOTO_OBJECTS', None)
-MODEL_PATH    = os.environ.get('INTERACT_MODELS', './models')
-OUTPUT_ROOT   = os.environ.get('HUMOTO_OUTPUT',   './data/humoto_processed')
-# Text source: animations.json from the HUMOTO release (has per-clip short_script).
-#   ln -s /path/to/humoto_adobe/animations.json ./data/humoto/animations.json
-HUMOTO_ANIMATIONS = os.environ.get('HUMOTO_ANIMATIONS', './data/humoto/animations.json')
+# ─── Paths ──────────────────────────────────────────────────────────────────
+# All default to the InterAct project root; override any with its env var.
+# NOTE: the HUMOTO *code* repo and the Adobe *data* release are BOTH named "humoto"
+# — keep them in separate trees. Symlink them once (point at YOUR locations):
+#   ln -s /path/to/humoto         ./humoto              # code repo (human_model/, scripts/)
+#   ln -s /path/to/humoto/humoto  ./data/humoto/raw     # data release (<seq>/<seq>.glb)
+#   ln -s /path/to/humoto_upbone  ./data/humoto/upbone  # extracted up_bone pickles
+HUMOTO_REPO    = os.environ.get('HUMOTO_REPO',    './humoto')                # HUMOTO code repo
+HUMOTO_JSON    = os.path.join(HUMOTO_REPO, 'human_model', 'human_model_up_bone_zup.json')
+HUMOTO_RAW     = os.environ.get('HUMOTO_RAW',     './data/humoto/raw')       # sequence GLBs
+HUMOTO_UPBONE  = os.environ.get('HUMOTO_UPBONE',  './data/humoto/upbone')    # extracted up_bone pickles
+HUMOTO_OBJECTS = os.environ.get('HUMOTO_OBJECTS', None)                      # per-object GLBs (full release); None -> read mesh from the sequence GLB (subset)
+MODEL_PATH     = os.environ.get('INTERACT_MODELS', './models')              # SMPL-X / SMPL-H model files
+OUTPUT_ROOT    = os.environ.get('HUMOTO_OUTPUT',  './data/humoto_processed') # outputs: sequences_seg/ (pre-canonical staging, feed to canonicalize_human.py) + objects/
+HUMOTO_ANIMATIONS = os.environ.get('HUMOTO_ANIMATIONS', './data/humoto/animations.json')  # per-clip short_script -> text.txt
 
 # humoto's differentiable Mixamo model lives in its repo
 sys.path.insert(0, HUMOTO_REPO)
@@ -164,6 +148,7 @@ SEQUENCE_CONFIG = {
 
 
 
+# ─── Models ───────────────────────────────────────────────────────────────────
 def load_models(model_path=MODEL_PATH, humoto_json=HUMOTO_JSON, device='cpu'):
     """Build the SMPL-X model (smplx, 16 betas) and the Mixamo FK model."""
     smplx_model = smplx.create(
@@ -174,6 +159,7 @@ def load_models(model_path=MODEL_PATH, humoto_json=HUMOTO_JSON, device='cpu'):
     return smplx_model, mx_model
 
 
+# ─── Mixamo forward kinematics → SMPL-X-indexed joint targets ───────────────────
 def _frame_to_pose_params(frame_dict):
     """humoto pickle frame {bone: [w,x,y,z,lx,ly,lz]} → {bone: [1,4,4]} for FK."""
     pp = {}
@@ -240,6 +226,7 @@ def load_all_targets(pkl_path, mx_model, body_corr=BODY_CORR, hand_corr=HAND_COR
     return body, hand, objs
 
 
+# ─── SMPL-X fitting (joint-position objective) ──────────────────────────────────
 def _fit_hands_frame(smplx_model, go, bp, tr, betas, hand_target, hand_idx,
                      lh_init, rh_init, n_steps, lr=0.05):
     """Fit left+right hand pose for ONE frame with the body frozen.
@@ -361,6 +348,7 @@ def fit_sequence(targets, smplx_model, hand_targets=None, hand_idx=HAND_SMPLX_ID
     return betas_fit, fitted_go, fitted_bp, fitted_tr, fitted_lh, fitted_rh, errors, hand_errors
 
 
+# ─── Objects ────────────────────────────────────────────────────────────────────
 def build_object_npz(objs, primary_object):
     """humoto object trajectory (z-up) → (angles, trans) in y-up axis-angle."""
     obj_zup = np.array(objs[primary_object], dtype=np.float32)  # (T, 7) [w,x,y,z,lx,ly,lz]
@@ -383,6 +371,7 @@ def build_object_mesh(glb_path, object_name, n_sample=340, seed=0, scene=None):
     return oriented, pts.astype(np.float32)
 
 
+# ─── Text (animations.json → text.txt) ──────────────────────────────────────────
 def _pos_tag(sentence, nlp):
     """Replicate process_text.process_text: drop non-alpha tokens, lemmatize
     NOUN/VERB (except 'left'), return 'word/POS word/POS ...'."""
@@ -432,6 +421,7 @@ def write_text_files(output_root=OUTPUT_ROOT, animations_json=HUMOTO_ANIMATIONS,
     return written
 
 
+# ─── End-to-end per-sequence pipeline ───────────────────────────────────────────
 def process_humoto_sequence(pkl_path, glb_path, seq_name, primary_object,
                             smplx_model, mx_model, output_root=OUTPUT_ROOT,
                             body_corr=BODY_CORR, seed=0, verbose=True):
@@ -466,17 +456,10 @@ def process_humoto_sequence(pkl_path, glb_path, seq_name, primary_object,
              trans=fitted_tr.astype(np.float32),
              gender='neutral')
 
-    # ── Objects: write EVERY object as object_<name>.npz (+ mesh + sample_points).
-    #    Multi-object STORAGE is faithful here: canonicalize_human canonicalizes
-    #    every object_<name>.npz. `primary_object` is the one motion.npy will use
-    #    as a TEMPORARY SCAFFOLD.
-    #    TODO(thesis, open question): true multi-object motion representation.
-    #    InterAct's motion.npy is single-object (476 human + 486 one-object). How
-    #    to encode N objects (concat? per-object reps? attention?) is unresolved —
-    #    flagged for advisor. For now motion.npy uses only `primary_object`.
-    # Per-object mesh source: if HUMOTO_OBJECTS is set, expect
-    # <HUMOTO_OBJECTS>/<obj>/<obj>.glb (full-release layout); else expect the
-    # object's mesh inside the sequence GLB (subset layout).
+    # Write EVERY object as object_<name>.npz (+ mesh + sample_points). motion.npy
+    # later uses only `primary_object` (single-object rep; multi-object encoding TBD).
+    # Mesh source: HUMOTO_OBJECTS/<obj>/<obj>.glb if set (full release), else the
+    # object's mesh inside the sequence GLB (subset).
     seq_scene = trimesh.load(glb_path) if HUMOTO_OBJECTS is None else None
     written_objs = []
     for obj_name in objs:
