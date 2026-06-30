@@ -44,6 +44,11 @@ HUMOTO_REPO   = os.environ.get('HUMOTO_REPO',     './humoto')
 HUMOTO_JSON   = os.path.join(HUMOTO_REPO, 'human_model', 'human_model_up_bone_zup.json')
 HUMOTO_RAW    = os.environ.get('HUMOTO_RAW',      './data/humoto/raw')
 HUMOTO_UPBONE = os.environ.get('HUMOTO_UPBONE',   './data/humoto/upbone')
+# Optional per-object GLB dir (full-dataset layout: humoto_objects_0805/<obj>/<obj>.glb).
+# When set, object meshes are loaded from there instead of being expected
+# inside the sequence GLB (the smaller released subset embeds them; the full
+# release does not).
+HUMOTO_OBJECTS = os.environ.get('HUMOTO_OBJECTS', None)
 MODEL_PATH    = os.environ.get('INTERACT_MODELS', './models')
 OUTPUT_ROOT   = os.environ.get('HUMOTO_OUTPUT',   './data/humoto_processed')
 # Text source: animations.json from the HUMOTO release (has per-clip short_script).
@@ -469,19 +474,44 @@ def process_humoto_sequence(pkl_path, glb_path, seq_name, primary_object,
     #    InterAct's motion.npy is single-object (476 human + 486 one-object). How
     #    to encode N objects (concat? per-object reps? attention?) is unresolved —
     #    flagged for advisor. For now motion.npy uses only `primary_object`.
-    scene = trimesh.load(glb_path)
+    # Per-object mesh source: if HUMOTO_OBJECTS is set, expect
+    # <HUMOTO_OBJECTS>/<obj>/<obj>.glb (full-release layout); else expect the
+    # object's mesh inside the sequence GLB (subset layout).
+    seq_scene = trimesh.load(glb_path) if HUMOTO_OBJECTS is None else None
     written_objs = []
     for obj_name in objs:
-        if obj_name not in scene.geometry:
-            if verbose:
-                print(f"   [skip obj] '{obj_name}': no GLB geometry")
-            continue
+        if HUMOTO_OBJECTS is not None:
+            obj_glb = os.path.join(HUMOTO_OBJECTS, obj_name, f'{obj_name}.glb')
+            if not os.path.isfile(obj_glb):
+                if verbose:
+                    print(f"   [skip obj] '{obj_name}': {obj_glb} not found")
+                continue
+            obj_scene = trimesh.load(obj_glb)
+            # Per-object GLBs usually have one geometry; tolerate any key.
+            if obj_name in obj_scene.geometry:
+                scene_for_mesh, lookup_key = obj_scene, obj_name
+            elif len(obj_scene.geometry) >= 1:
+                scene_for_mesh, lookup_key = obj_scene, next(iter(obj_scene.geometry))
+            else:
+                if verbose:
+                    print(f"   [skip obj] '{obj_name}': {obj_glb} has no geometry")
+                continue
+            glb_path_for_mesh = obj_glb
+        else:
+            if obj_name not in seq_scene.geometry:
+                if verbose:
+                    print(f"   [skip obj] '{obj_name}': no GLB geometry")
+                continue
+            scene_for_mesh, lookup_key = seq_scene, obj_name
+            glb_path_for_mesh = glb_path
+
         ang, tr = build_object_npz(objs, obj_name)
         np.savez(os.path.join(out_seq_dir, f'object_{obj_name}.npz'),
                  angles=ang, trans=tr, name=obj_name)
         obj_dir = os.path.join(output_root, 'objects', obj_name)
         os.makedirs(obj_dir, exist_ok=True)
-        mesh, pts = build_object_mesh(glb_path, obj_name, seed=seed, scene=scene)
+        mesh, pts = build_object_mesh(glb_path_for_mesh, lookup_key,
+                                      seed=seed, scene=scene_for_mesh)
         np.save(os.path.join(obj_dir, 'sample_points.npy'), pts)
         mesh.export(os.path.join(obj_dir, f'{obj_name}.obj'))
         written_objs.append(obj_name)
