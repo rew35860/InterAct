@@ -4,7 +4,10 @@ Drops HUMOTO's Mixamo joint POSITIONS straight into the 52 SMPLH slots and packs
 a schema-correct .pt for OmniRetarget. (The other "arm" fits SMPL-X first; both
 end up as 52 joint positions + an object pose, which is all OmniRetarget reads.)
 
-Pipeline:  Mixamo FK (process_humoto.compute_targets) -> 52 SMPLH slots
+Fills the 15 body joints + the 10 *4 fingertips — the wuji-hand format reads the
+fingertip slots L/R_{Thumb,Index,Middle,Ring,Pinky}3; all other slots stay zero.
+
+Pipeline:  Mixamo FK (process_humoto.load_all_targets) -> body + fingertip slots
            -> y-up to z-up -> floor-normalize -> pack columns
            [162:318]=joints, [318:325]=object pose.
 
@@ -27,12 +30,11 @@ for _var, _hint in [('HUMOTO_UPBONE', 'the up_bone pkl dir (Stage-A output)'),
     if _var not in os.environ:
         sys.exit(f"Set ${_var} to {_hint}, e.g.\n  export {_var}=...")
 
-import pickle
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation as sRot
 
-from process.process_humoto import compute_targets, build_object_npz, HUMOTO_UPBONE, HUMOTO_JSON
+from process.process_humoto import load_all_targets, build_object_npz, HUMOTO_UPBONE, HUMOTO_JSON, HAND_CORR
 from human_model.human_model import HumanModelDifferentiable
 
 # clip -> primary object (must match models/g1/g1_29dof_w_<obj>.xml and the pkl's object key)
@@ -74,6 +76,15 @@ SMPLX_TO_SMPLH = {
     21: 36,  # right_wrist   -> R_Wrist
 }
 
+# *4 fingertip (Mixamo <finger>4 tip) -> the SMPLH distal slot the wuji-hand mapping
+# targets (L_Index3 -> wj_left_finger2_link4, etc.). Decision A: aim at the *4 TIP.
+FINGERTIP_TO_SMPLH = {
+    'left_index':  20, 'left_middle':  23, 'left_pinky':  26, 'left_ring':  29, 'left_thumb':  32,
+    'right_index': 39, 'right_middle': 42, 'right_pinky': 45, 'right_ring': 48, 'right_thumb': 51,
+}
+# each tip's row in load_all_targets' hand (T,40,3) == its index in HAND_CORR
+_HAND_TIP_POS = {name: i for i, (_, name, _) in enumerate(HAND_CORR)}
+
 R_X = sRot.from_euler('x', np.pi / 2)    # y-up -> z-up (same 90deg as interact2mimic)
 PT_WIDTH = 331 + 52 + 52 * 4             # 591
 
@@ -105,15 +116,16 @@ def _floor_z(joints, obj, quat, trans):
 
 
 def pack_clip(seq, obj, mx_model):
-    data = pickle.load(open(os.path.join(HUMOTO_UPBONE, seq, f'{seq}.pkl'), 'rb'))
-    arm, objs = data['armature'], data['objects']
+    pkl_path = os.path.join(HUMOTO_UPBONE, seq, f'{seq}.pkl')
+    body, hand, objs = load_all_targets(pkl_path, mx_model)  # body (T,22,3), hand (T,40,3), y-up
 
     # Mixamo joints (y-up) -> 52 SMPLH slots (unmapped slots stay zero)
-    targets = compute_targets(arm, mx_model)          # (T, 22, 3)
-    T = targets.shape[0]
+    T = body.shape[0]
     joints = np.zeros((T, 52, 3), np.float32)
-    for sx, sh in SMPLX_TO_SMPLH.items():
-        joints[:, sh] = targets[:, sx]
+    for sx, sh in SMPLX_TO_SMPLH.items():             # 15 body joints
+        joints[:, sh] = body[:, sx]
+    for tip, sh in FINGERTIP_TO_SMPLH.items():        # 10 *4 fingertips -> wuji slots
+        joints[:, sh] = hand[:, _HAND_TIP_POS[tip]]
 
     # object trajectory (y-up)
     if obj not in objs:
